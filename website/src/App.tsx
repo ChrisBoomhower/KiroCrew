@@ -457,7 +457,19 @@ function NavItem({ path, label, icon, active, collapsed, badge, onClickOverride,
     >
       {badge}
       {iconEl}
-      {!collapsed && <span className="whitespace-nowrap overflow-hidden">{label}</span>}
+      {/* `title` carries the FULL label: this span is `whitespace-nowrap overflow-hidden`, so a
+          translation longer than the rail is silently cut off with no way to read it. Surfaced by
+          the render gate under the en-XA pseudolocale at 2.2x once a new app entry narrowed the
+          row (`layout/clipped-without-title`). Same remedy the Apps section header already
+          carries. `label` is already the resolved, translated string. */}
+      {!collapsed && (
+        <span
+          title={typeof label === 'string' ? label : undefined}
+          className="whitespace-nowrap overflow-hidden"
+        >
+          {label}
+        </span>
+      )}
       {collapsed && tip && createPortal(
         <div
           className={`fixed flex items-center gap-2.5 pl-3 pr-3 rounded-md bg-card border border-border shadow-lg text-text text-sm font-medium z-[9999] pointer-events-none whitespace-nowrap transition-opacity duration-150 ${tipOn ? 'opacity-100' : 'opacity-0'}`}
@@ -540,7 +552,13 @@ function NavToggle({ collapsed, expanded, hiddenCount, onClick }: {
       onBlur={hideTip}
     >
       <span className="w-4 h-4 flex items-center justify-center shrink-0 opacity-70"><Icon size={16} /></span>
-      {!collapsed && <span className="whitespace-nowrap overflow-hidden">{labelText}</span>}
+      {/* Same reason as the nav-item label above: clipped by `whitespace-nowrap
+          overflow-hidden`, so the full string has to live on `title`. */}
+      {!collapsed && (
+        <span title={labelText} className="whitespace-nowrap overflow-hidden">
+          {labelText}
+        </span>
+      )}
       {collapsed && tip && createPortal(
         <div
           className={`fixed flex items-center gap-2.5 pl-3 pr-3 rounded-md bg-card border border-border shadow-lg text-text text-sm font-medium z-[9999] pointer-events-none whitespace-nowrap transition-opacity duration-150 ${tipOn ? 'opacity-100' : 'opacity-0'}`}
