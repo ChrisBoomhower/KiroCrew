@@ -290,17 +290,31 @@ function quitOtherApp(appName) {
 // Function declarations are hoisted, so the helpers defined further down this
 // file are available here.
 //
-// Platforms without lsof//bin/ps (Windows) resolve to "unknown", which reuses.
-// That is the safe direction: reuse can never produce two gateways on one data
-// home, so the cross-app mutex still holds — only the eviction prompt is lost,
-// and eviction was already darwin-only (canTakeover below).
+// On Windows, uses netstat+tasklist instead of lsof/ps. Returns "kirocrew",
+// "foreign", "none", or "unknown" — same contract as classifyPortOwner.
 function probeGatewayPortOwner(port) {
+  if (IS_WIN) return _probePortOwnerWin32(port);
   return classifyPortOwner(port, {
     getListenPids: _lsofListenPids,
     getCommand: _psCommand,
     getPpid: _psPpid,
     log: glog,
   });
+}
+
+async function _probePortOwnerWin32(port) {
+  try {
+    const pids = await _netstatListenPids(port);
+    if (!pids.length) return "none";
+    for (const pid of pids) {
+      const cmd = await _tasklistCommand(pid);
+      if (/kiro_crew|kirocrew/i.test(cmd)) return "kirocrew";
+    }
+    return "foreign";
+  } catch (e) {
+    glog(`port-owner(win32): probe failed (${e && e.message})`);
+    return "unknown";
+  }
 }
 
 // Budget: the other app's graceful gateway stop runs up to 15s
@@ -555,6 +569,17 @@ function spawnGateway(resolve) {
           if (fs.existsSync(pyExe)) {
             spawnBin = pyExe;
             spawnArgs = ["-s", "-m", "kiro_crew", ...spawnArgs];
+          } else {
+            // Bundled layout is present but python.exe is missing/corrupted.
+            // Surface this as a clear error instead of letting spawn() hang or
+            // emit a cryptic ENOENT for the .cmd shim.
+            const errMsg = `Bundled Python interpreter not found at ${pyExe}. `
+              + `The installation may be corrupted — reinstall the app.`;
+            glog(`spawn ERROR: ${errMsg}`);
+            gatewayStartFailure = { error: errMsg };
+            sendStatus(`Gateway failed: ${errMsg}`);
+            resolve(false);
+            return;
           }
         }
         const child = spawn(spawnBin, spawnArgs, {
@@ -621,15 +646,42 @@ function spawnGateway(resolve) {
  * Gracefully stop the embedded gateway and await its exit (POST /api/shutdown
  * -> SIGTERM -> SIGKILL). Core logic lives in gateway-stop.js for testability;
  * this thin wrapper binds the module-level child process + config.
+ *
+ * Uses call-time home resolution (secretCandidates) rather than the boot-time
+ * KIROCREW_HOME pin, because on the migration launch the boot-time dir may
+ * have been deleted by the backend — the secret lives in whichever candidate
+ * still exists at shutdown time.
  */
 async function stopGatewayGracefully({ timeoutMs = 15000 } = {}) {
   const proc = gatewayProcess;
   if (!proc || proc.exitCode !== null) { gatewayProcess = null; return; }
   console.log("Stopping gateway gracefully...");
+  // Resolve the secret location at call time: try each candidate in order
+  // (canonical first, legacy second) so graceful stop works even when the
+  // boot-time home was moved/deleted during migration.
+  const candidates = secretCandidates();
+  const kirocrewHome = path.dirname(candidates[0]); // canonical dir
   await _stopGatewayGracefully(proc, {
     backendUrl: BACKEND_URL,
-    kirocrewHome: KIROCREW_HOME,
+    kirocrewHome,
     timeoutMs,
+    // Override secret reading to use the candidate list
+    fsMod: {
+      ...fs,
+      readFileSync: (filePath, encoding) => {
+        // If postShutdown reads .local_secret from the passed home, try all candidates
+        if (typeof filePath === "string" && filePath.endsWith(".local_secret")) {
+          for (const candidate of candidates) {
+            try {
+              const value = fs.readFileSync(candidate, encoding);
+              if (value && value.trim()) return value;
+            } catch { /* try next */ }
+          }
+          throw new Error("no readable .local_secret in any candidate");
+        }
+        return fs.readFileSync(filePath, encoding);
+      },
+    },
   });
   gatewayProcess = null;
 }
@@ -1104,15 +1156,17 @@ function setupWindowContents(win, backendUrl) {
   view.webContents.on("page-title-updated", (e) => { e.preventDefault(); applyTitle(); });
 
   view.webContents.on("did-finish-load", () => {
-    // macOS + Linux only: the frameless window needs an injected drag region so
-    // the dashboard header can move the window. Windows uses a native title bar,
-    // which already provides dragging — injecting an app-region bar over the
-    // header would only risk swallowing clicks, so skip it there.
-    if (!IS_WIN) {
+    // macOS + Windows + Linux (non-native-frame): the frameless window needs
+    // an injected drag region so the dashboard header can move the window.
+    // On macOS titleBarStyle:"hidden" makes the whole window frameless; on
+    // Windows titleBarOverlay provides caption controls but no drag area.
+    // The drag bar is pointer-events:none so clicks pass through to the SPA;
+    // interactive controls are marked no-drag so they remain clickable.
+    if (IS_MAC || IS_WIN) {
       view.webContents.insertCSS(`
         #electron-drag-bar {
           position: fixed;
-          top: 0; left: 0; right: 0;
+          top: 0; left: 0; right: ${IS_WIN ? '138px' : '0'};
           height: 42px;
           -webkit-app-region: drag;
           z-index: 99999;
@@ -1230,14 +1284,20 @@ function createWindow() {
     minHeight: 600,
     backgroundColor: "#0f1117",
   };
-  // Frameless chrome is macOS-only: the dashboard's 42px header doubles as
-  // the title bar with the native traffic lights inset into it. Windows has
-  // no equivalent inset controls -- hiding the title bar there would ship
-  // windows with no minimize/maximize/close at all -- so it keeps the native
-  // frame, exactly like the shipped Linux AppImage (Electron ignores
-  // titleBarStyle on Linux). A Windows title-bar overlay with inset controls
-  // is the tracked follow-up.
+  // Frameless chrome: the dashboard's 42px header doubles as the title bar.
+  // macOS: titleBarStyle:"hidden" + native traffic lights inset into it.
+  // Windows: titleBarStyle:"hidden" + titleBarOverlay puts native caption
+  //   controls (minimize/maximize/close) in an overlay strip synced to theme.
+  // Linux: Electron ignores titleBarStyle, so it keeps the native frame.
   if (IS_MAC) opts.titleBarStyle = "hidden";
+  if (IS_WIN) {
+    opts.titleBarStyle = "hidden";
+    opts.titleBarOverlay = {
+      color: nativeTheme.shouldUseDarkColors ? "#0f1117" : "#f8fafc",
+      symbolColor: nativeTheme.shouldUseDarkColors ? "#e2e8f0" : "#1e293b",
+      height: 42,
+    };
+  }
   // Window + taskbar icon (Windows only): running unpackaged (`electron .`)
   // otherwise shows the default Electron icon. macOS takes its icon from the
   // .app bundle and Linux from the .desktop/AppImage, so leave those untouched.
@@ -1597,6 +1657,7 @@ function _psPpid(pid) {
  * @returns {Promise<{killed:number, freed:boolean, survivors:number[]}>}
  */
 function forceStopGatewayPort(port) {
+  if (IS_WIN) return forceStopGatewayPortWin32(port);
   return forceStopPort(port, {
     getListenPids: _lsofListenPids,
     getCommand: _psCommand,
@@ -1604,6 +1665,103 @@ function forceStopGatewayPort(port) {
     kill: (pid, sig) => process.kill(pid, sig),
     sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
     log: glog,
+  });
+}
+
+/**
+ * Windows implementation of force-stop via netstat + taskkill. Finds PIDs
+ * LISTENing on the given port, filters to Kiro Crew processes via WMIC,
+ * then kills them with taskkill /F /PID.
+ */
+async function forceStopGatewayPortWin32(port) {
+  // Find PIDs listening on the port via netstat
+  const pids = await _netstatListenPids(port);
+  if (!pids.length) {
+    glog(`force-stop(win32): no LISTEN owner found on :${port}`);
+    return { killed: 0, freed: true, survivors: [], foreignHolder: false, serviceHolder: false };
+  }
+  const targets = [];
+  for (const pid of pids) {
+    const cmd = await _tasklistCommand(pid);
+    if (/kiro_crew|kirocrew/i.test(cmd)) {
+      try {
+        // taskkill /F /PID is the Windows equivalent of SIGKILL
+        await _taskkill(pid);
+        targets.push(pid);
+        glog(`force-stop(win32): killed pid=${pid} (${cmd.slice(0, 80)})`);
+      } catch (e) {
+        glog(`force-stop(win32): taskkill pid=${pid} failed: ${e && e.message}`);
+      }
+    } else {
+      glog(`force-stop(win32): SKIP pid=${pid} — not a Kiro Crew process (${cmd.slice(0, 80)})`);
+    }
+  }
+  // Verify the port freed
+  const killed = targets.length;
+  await new Promise((r) => setTimeout(r, 1000));
+  const remaining = await _netstatListenPids(port);
+  const survivors = targets.filter((pid) => remaining.includes(pid));
+  const freed = remaining.length === 0;
+  const foreignHolder = !freed && survivors.length === 0;
+  if (survivors.length) {
+    glog(`force-stop(win32): port :${port} STILL held after kill by pid ${survivors.join(", ")}`);
+  }
+  return { killed, freed, survivors, foreignHolder, serviceHolder: false };
+}
+
+/** Parse netstat -ano output for PIDs LISTENing on the given port (Windows).
+ * Locale-safe: matches by column structure (local-addr:port + wildcard foreign
+ * endpoint) rather than the state string, which is translated on non-English
+ * Windows (e.g. "ABHÖREN", "ÉCOUTE"). */
+function _netstatListenPids(port) {
+  return new Promise((resolve) => {
+    execFile("netstat", ["-ano", "-p", "TCP"], { timeout: 5000 }, (err, stdout) => {
+      if (err) return resolve([]);
+      const pids = [];
+      const portRe = new RegExp(`:${port}\\b`);
+      for (const line of String(stdout).split(/\r?\n/)) {
+        const parts = line.trim().split(/\s+/);
+        // Expected columns: Proto LocalAddr ForeignAddr State PID
+        if (parts.length < 5) continue;
+        if (!/^TCP/i.test(parts[0])) continue;
+        const localAddr = parts[1];
+        const foreignAddr = parts[2];
+        // A listening socket has the local port we want + wildcard foreign endpoint
+        if (!portRe.test(localAddr)) continue;
+        if (foreignAddr !== "0.0.0.0:0" && foreignAddr !== "[::]:0") continue;
+        const pid = parseInt(parts[parts.length - 1], 10);
+        if (Number.isInteger(pid) && pid > 0 && !pids.includes(pid)) pids.push(pid);
+      }
+      resolve(pids);
+    });
+  });
+}
+
+/** Get the full command line for a PID via WMIC, falling back to PowerShell
+ * Get-CimInstance if wmic is unavailable (deprecated/removed on some Win 11). */
+function _tasklistCommand(pid) {
+  return new Promise((resolve) => {
+    execFile("wmic", ["process", "where", `ProcessId=${pid}`, "get", "CommandLine", "/FORMAT:LIST"],
+      { timeout: 5000 }, (err, stdout) => {
+        const result = String(stdout || "").trim();
+        if (!err && result) return resolve(result);
+        // Fallback: PowerShell Get-CimInstance (works when wmic is absent)
+        const ps = `Get-CimInstance Win32_Process -Filter "ProcessId=${pid}" | Select-Object -ExpandProperty CommandLine`;
+        execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", ps],
+          { timeout: 8000 }, (_psErr, psOut) => {
+            resolve(String(psOut || "").trim());
+          });
+      });
+  });
+}
+
+/** Force-kill a process by PID using taskkill (Windows). */
+function _taskkill(pid) {
+  return new Promise((resolve, reject) => {
+    execFile("taskkill", ["/F", "/PID", String(pid)], { timeout: 10000 }, (err) => {
+      if (err) return reject(err);
+      resolve();
+    });
   });
 }
 
@@ -1931,8 +2089,17 @@ async function openNewConnectionWindow() {
       backgroundColor: "#0f1117",
     };
     // Same platform-conditional chrome as the main window (see createWindow):
-    // frameless + inset traffic lights on macOS, native frame elsewhere.
+    // frameless + inset traffic lights on macOS, titleBarOverlay on Windows,
+    // native frame elsewhere (Linux).
     if (IS_MAC) connOpts.titleBarStyle = "hidden";
+    if (IS_WIN) {
+      connOpts.titleBarStyle = "hidden";
+      connOpts.titleBarOverlay = {
+        color: nativeTheme.shouldUseDarkColors ? "#0f1117" : "#f8fafc",
+        symbolColor: nativeTheme.shouldUseDarkColors ? "#e2e8f0" : "#1e293b",
+        height: 42,
+      };
+    }
     if (IS_MAC) connOpts.trafficLightPosition = trafficLightPositionForZoom(1);
     const connWin = new BaseWindow(connOpts);
 
@@ -2211,6 +2378,23 @@ app.whenReady().then(async () => {
   ipcMain.on("theme-mode-changed", (_event, pref) => {
     if (pref === "system" || pref === "dark" || pref === "light") {
       nativeTheme.themeSource = resolveThemeSource(pref, "");
+    }
+  });
+
+  // Windows titleBarOverlay color sync: when the resolved dark/light mode
+  // changes, update the overlay background and symbol colors to match. The
+  // renderer sends the resolved mode ("dark" | "light") after any theme change.
+  ipcMain.on("titlebar-overlay-theme", (_event, mode) => {
+    if (!IS_WIN) return;
+    const dark = mode === "dark";
+    const color = dark ? "#0f1117" : "#f8fafc";
+    const symbolColor = dark ? "#e2e8f0" : "#1e293b";
+    for (const win of BaseWindow.getAllWindows()) {
+      try {
+        if (typeof win.setTitleBarOverlay === "function") {
+          win.setTitleBarOverlay({ color, symbolColor, height: 42 });
+        }
+      } catch { /* window mid-teardown */ }
     }
   });
 
