@@ -50,7 +50,7 @@ from kiro_crew.apps.dependency_ledger import (
 )
 from kiro_crew.apps.event_bus import build_broadcast_fn
 from kiro_crew.apps.execution import app_execution_denied
-from kiro_crew.apps.hooks_integration import on_app_disable, on_app_enable
+from kiro_crew.apps.hooks_integration import on_app_enable
 from kiro_crew.apps.manager import (
     app_lifecycle_lock,
     apps_dir,
@@ -64,6 +64,7 @@ from kiro_crew.apps.manager import (
     list_apps,
     register_external_app,
     resolve_mcp_backend_url,
+    trust_grant_removal_blocked,
     uninstall_app,
     update_app,
 )
@@ -80,6 +81,7 @@ from kiro_crew.apps.registry import (
     registry_name_from_source,
 )
 from kiro_crew.apps.spawn_sdk import build_spawn_impl
+from kiro_crew.apps.teardown import teardown_app_runtime
 from kiro_crew.apps.version import check_min_version as _check_min_version_str
 from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config.loader import KiroCrewConfig, config_dir, config_path
@@ -828,6 +830,46 @@ async def handle_uninstall_app(request: web.Request) -> web.Response:
     # timeout — acceptable, since those ops genuinely conflict and the lock is
     # per-app (other apps are unaffected).
     async with app_lifecycle_lock(name):
+        # Step 0: the execution grant must be removable before anything is
+        # destroyed. A grant is keyed on the app NAME alone, so one left behind
+        # admits a DIFFERENT app later installed under this name — code execution
+        # with no consent prompt. That check used to live inside uninstall_app
+        # (Step 5), which made it unreachable as an abort: by then the cron
+        # manifest, the onUninstall script, the backend and the dependencies had
+        # all already been torn down, so the refusal stranded a half-removed app
+        # and every retry re-ran the non-idempotent script. Asking here keeps the
+        # refusal free and the retry safe, exactly like the cron precondition.
+        grant_blocked = trust_grant_removal_blocked(name)
+        if grant_blocked:
+            logger.warning(
+                "Uninstall of %s ABORTED: trust grant not removable (%s)",
+                name,
+                grant_blocked,
+            )
+            sel().log_api_access(
+                caller="dashboard",
+                operation="app_uninstall",
+                outcome="denied",
+                resources=f"app={name}",
+                error=f"trust grant not removable, uninstall aborted: {grant_blocked}",
+            )
+            return web.json_response(
+                {
+                    "error": (
+                        f"not uninstalling {name!r}: its third-party execution "
+                        f"grant could not be removed ({grant_blocked}). The grant "
+                        f"is keyed on the name, so removing the app while it "
+                        f"stands would let any future app installed under this "
+                        f"name run code without asking. Nothing has been changed "
+                        f"— clear the cause and retry."
+                    ),
+                    "code": "trust_grant_not_removed",
+                    "retryable": True,
+                    "app": name,
+                },
+                status=409,
+            )
+
         # Step 1: Cron cleanup is the FIRST uninstall precondition, run BEFORE
         # the (possibly destructive, non-idempotent) onUninstall script and
         # BEFORE the backend is stopped. Uninstall is irreversible: below this
@@ -1249,7 +1291,6 @@ async def handle_disable_app(request: web.Request) -> web.Response:
     if not info:
         return web.json_response({"error": f"app {name!r} not installed"}, status=404)
 
-    resources = info.get("resources", "gateway")
     manifest = info.get("manifest", {})
     on_disable = (manifest.get("setup") or {}).get("onDisable", "")
     disable_timeout = int((manifest.get("setup") or {}).get("onDisableTimeout", 30))
@@ -1272,23 +1313,17 @@ async def handle_disable_app(request: web.Request) -> web.Response:
                 warnings.append(f"onDisable script failed: {cleaned}")
                 logger.warning("onDisable failed for %s, proceeding with disable", name)
 
-        # Invoke Python lifecycle hooks (on_shutdown + route deregistration + cron cleanup)
-        try:
-            hooks_result = await on_app_disable(name, info)
-            if hooks_result:
-                for k, v in hooks_result.items():
-                    if k == "cron_cleanup" and isinstance(v, str):
-                        warnings.append(v)
-        except Exception as exc:
-            logger.warning("Hook disable failed for %s: %s", name, exc)
-            warnings.append(_redact_warning(f"hooks disable failed: {exc}"))
-
-        # Deregister resources if gateway-managed
-        if resources == "gateway":
-            await asyncio.get_running_loop().run_in_executor(
-                subprocess_executor(), stop_app_backend, name
-            )
-            deregister_app(name)
+        # Invoke Python lifecycle hooks, stop the backend PROCESS, and deregister
+        # resources through the ONE shared teardown that revoking an app's
+        # third-party execution grant also calls — see apps/teardown.py. Keeping a
+        # second copy here is how the revoke path came to miss steps.
+        teardown = await teardown_app_runtime(name, info)
+        # This handler's documented contract is that disable proceeds even when a
+        # step fails, so both lists become user-visible warnings rather than an
+        # abort. (Trust revocation treats `failures` as fatal instead — it must not
+        # claim an app was stopped when its crons may still fire.)
+        for note in (*teardown.warnings, *teardown.failures):
+            warnings.append(_redact_warning(note))
 
         result = disable_app(name)
         if not result.ok:

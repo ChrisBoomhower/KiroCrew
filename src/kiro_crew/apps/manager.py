@@ -31,7 +31,7 @@ from kiro_crew.apps.execution import (
 )
 from kiro_crew.apps.manifest import AppManifest
 from kiro_crew.atomic_write import atomic_write
-from kiro_crew.config.loader import config_dir
+from kiro_crew.config.loader import KiroCrewConfig, config_dir, config_local_path, config_path
 from kiro_crew.platform import current_context, safe_context_call
 from kiro_crew.sel import sel
 
@@ -762,6 +762,35 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
     if not dest.is_dir():
         return AppResult(ok=False, name=name, error=f"app {name!r} is not installed")
 
+    # Withdraw the execution grant FIRST, and abort the whole uninstall if it
+    # cannot be withdrawn.
+    #
+    # A grant is keyed on the app NAME and nothing else, so one left behind admits
+    # a DIFFERENT app later installed under this name — in-process code execution
+    # with no consent prompt, because the gate just sees a name it was told to
+    # trust. Doing this AFTER the files were deleted (as this did) produced a state
+    # the user could not recover from: the app is gone, so there is nothing left to
+    # uninstall and no retry that would clear the grant, while the name stays
+    # armed. Ordering it first makes the failure retryable — nothing has been
+    # destroyed, the user fixes the cause (typically an overlay-owned setting) and
+    # runs uninstall again. Same reasoning as the revoke path, which runs teardown
+    # before its config write for exactly this reason.
+    try:
+        _drop_trust_grant(name)
+    except Exception as exc:  # noqa: BLE001 - refuse rather than half-uninstall
+        logger.warning("trust-grant cleanup on uninstall of %r failed", name, exc_info=True)
+        return AppResult(
+            ok=False,
+            name=name,
+            error=(
+                f"not uninstalling {name!r}: its third-party execution grant could "
+                f"not be removed ({exc}). The grant is keyed on the name, so removing "
+                f"the app while it stands would let any future app installed under "
+                f"this name run code without asking. Clear the cause and retry."
+            ),
+            error_code="trust_grant_not_removed",
+        )
+
     try:
         if keep_data:
             data = dest / "data"
@@ -789,6 +818,82 @@ def uninstall_app(name: str, *, keep_data: bool = True) -> AppResult:
     except Exception:
         logger.debug("dev-mode cleanup on uninstall of %r failed", name, exc_info=True)
     return AppResult(ok=True, name=name, message=f"uninstalled {name}")
+
+
+def trust_grant_removal_blocked(name: str) -> str | None:
+    """Return why *name*'s execution grant could not be dropped, or ``None``.
+
+    A read-only PRECONDITION. Both uninstall entry points run destructive,
+    non-idempotent work (cron deregistration, the app's own ``onUninstall``
+    script, backend stop, dependency cleanup) before they reach
+    :func:`uninstall_app`, so a refusal discovered inside ``uninstall_app`` is
+    not the retryable "nothing has been destroyed" case it was written as: it
+    strands a half-removed app and re-runs ``onUninstall`` on every retry. Callers
+    therefore ask this FIRST and abort while it is still free to abort — the same
+    reason the cron cleanup is ordered ahead of the script.
+    """
+    # An overlay-owned grant cannot be dropped by writing config.json: the loader
+    # deep-merges config.local.json OVER it and save() strips overlay-owned values
+    # from the output, so the write is ineffective in both directions.
+    #
+    # Scoped to a grant this app actually holds. An overlay that pins
+    # `apps_trusted` for OTHER apps says nothing about THIS uninstall, and gating
+    # on the key's mere presence made every app un-uninstallable for any operator
+    # who set it at all — a blanket refusal, not a grant-specific one.
+    local = config_local_path()
+    if local.is_file():
+        try:
+            raw_local = json.loads(local.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            raw_local = {}  # the loader ignores an unreadable overlay, so do we
+        agent_local = raw_local.get("agent") if isinstance(raw_local, dict) else None
+        if isinstance(agent_local, dict):
+            overlay_grants = agent_local.get("apps_trusted")
+            # A non-list overlay value cannot express a grant for this app, so
+            # there is nothing here that a write would have to survive.
+            if isinstance(overlay_grants, list) and name in overlay_grants:
+                return f"apps_trusted is set in {local}, which overrides config.json"
+
+    path = config_path()
+    if path.is_file():
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            # Report rather than stay silent: a quiet bail here is precisely the
+            # "uninstalled but still trusted" state the caller must not reach. The
+            # write is still refused (it would erase everything else the file
+            # holds) — it just is not refused quietly.
+            return f"{path} is unreadable: {exc}"
+    return None
+
+
+def _drop_trust_grant(name: str) -> None:
+    """Remove *name* from ``agent.apps_trusted``, if present.
+
+    A no-op when the app held no grant, which is the common case. Refuses to write
+    over an unparseable ``config.json`` for the same reason the trusted-apps
+    endpoints do: ``KiroCrewConfig.load()`` degrades a corrupt file to defaults, so
+    a blind load/save would erase everything else the file holds.
+    """
+    blocked = trust_grant_removal_blocked(name)
+    if blocked:
+        raise RuntimeError(blocked)
+
+    path = config_path()
+    if path.is_file():
+        try:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{path} is unreadable: {exc}") from exc
+        if not isinstance(existing, dict):
+            return
+    cfg = KiroCrewConfig.load()
+    current = getattr(cfg.agent, "apps_trusted", [])
+    if not isinstance(current, list) or name not in current:
+        return
+    cfg.agent.apps_trusted = [a for a in current if a != name]
+    cfg.save()
+    logger.info("Dropped third-party trust grant for uninstalled app %s", name)
 
 
 # ---------------------------------------------------------------------------
