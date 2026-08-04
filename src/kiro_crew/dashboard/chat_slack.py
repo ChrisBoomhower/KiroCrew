@@ -9,11 +9,12 @@ from aiohttp import web
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.dashboard import state as dashboard_state
 from kiro_crew.dashboard.chat_persistence import save_slot_off_loop
-from kiro_crew.dashboard.chat_utils import effective_session_key
+from kiro_crew.dashboard.chat_utils import effective_session_key, remember_slack_options
 from kiro_crew.dashboard.state import DashboardState
 from kiro_crew.security import redact_and_truncate
 from kiro_crew.sel import sel
 from kiro_crew.slack.channel_resolver import _CACHE_FILENAME, ChannelNameResolver
+from kiro_crew.slack.outbound import post_assistant_text
 from kiro_crew.sync_bridge import handoff_to_slack
 
 logger = logging.getLogger(__name__)
@@ -128,17 +129,36 @@ async def api_chat_slot_slack_link(request: web.Request) -> web.Response:
     # Linking to an existing thread (challenge-and-redirect) would duplicate
     # messages the thread already contains.
     if not existing_thread:
-        for m in slot.messages[-5:]:
+        # Filter to displayable turns BEFORE slicing: the transcript also holds
+        # rows that are never replayed (queue-cycle markers and other system
+        # entries), and a trailing one of those would otherwise make the last
+        # real reply look superseded and render its choices spent.
+        recent = [
+            m
+            for m in slot.messages
+            if m.get("role") in ("user", "assistant") and (m.get("content") or "")
+        ][-5:]
+        for idx, m in enumerate(recent):
             role = m.get("role", "")
-            txt = redact_and_truncate(m.get("content") or "", max_chars=2000)
-            if role in ("user", "assistant") and txt:
-                icon = "\U0001f9d1" if role == "user" else "\U0001f916"
-                try:
-                    await state.slack_client.post_message(
-                        target_channel, f"{icon} {txt}", thread_ts
-                    )
-                except Exception:
-                    pass
+            content = m.get("content") or ""
+            icon = "\U0001f9d1" if role == "user" else "\U0001f916"
+            # Only the newest message may carry a live OPTIONS control, and only
+            # when it is the assistant's: an earlier one asked a question this
+            # replay has already moved past, so its choices render struck
+            # through rather than inviting an answer to a stale question.
+            is_newest_reply = role == "assistant" and idx == len(recent) - 1
+            try:
+                posted = await post_assistant_text(
+                    state.slack_client,
+                    target_channel,
+                    f"{icon} {content}",
+                    thread_ts,
+                    interactive=is_newest_reply,
+                    truncate_to=2000,
+                )
+                remember_slack_options(state, session_key, posted)
+            except Exception:
+                logger.debug("Failed to backfill message into Slack thread", exc_info=True)
 
     sel().log_api_access(
         caller="dashboard",

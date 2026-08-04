@@ -1250,12 +1250,36 @@ async def api_send_message(request: web.Request) -> web.Response:
                             )
                             if options:
                                 try:
-                                    await state.slack_client.post_blocks(
+                                    option_blocks = build_options_blocks(options)
+                                    option_ts = await state.slack_client.post_blocks(
                                         channel,
-                                        build_options_blocks(options),
+                                        option_blocks,
                                         text,
                                         thread_ts=thread_ts,
                                     )
+                                    # A thread IS a conversation, so bind the
+                                    # control to that thread's session and let
+                                    # its next turn strike it through. Without a
+                                    # thread there is no conversation to
+                                    # supersede it, so nothing is recorded.
+                                    if thread_ts and option_ts:
+                                        from kiro_crew.dashboard.chat_utils import (
+                                            remember_slack_options,
+                                        )
+                                        from kiro_crew.messaging.link import canonical_key
+                                        from kiro_crew.slack.outbound import PostedOptions
+
+                                        remember_slack_options(
+                                            state,
+                                            canonical_key(str(thread_ts)),
+                                            PostedOptions(
+                                                channel=channel,
+                                                ts=option_ts,
+                                                choices=tuple(options),
+                                                blocks=tuple(option_blocks),
+                                                text=text,
+                                            ),
+                                        )
                                 except Exception:
                                     logger.debug(
                                         "send_message: failed to post OPTIONS blocks",

@@ -36,6 +36,7 @@ from kiro_crew.slack.handler import (
     _is_slack_restricted,
     _should_auto_approve_spawn,
     _thread_agents,
+    get_dashboard_state,
     is_slack_session_trusted,
     maybe_apply_privacy_modifiers,
     maybe_handle_keyword_command,
@@ -133,6 +134,14 @@ async def handle_message_transport(
     # auth recheck + bang fall-through) instead of spawning a fresh session.
     if await maybe_route_linked_thread(text, session_key, user_id, channel, slack, reply_ts):
         return
+
+    # A new turn supersedes whatever question the previous one ended on, so any
+    # OPTIONS control still live in this thread stops being answerable. Runs
+    # after the linked-thread intercept because that path routes into _run_chat,
+    # which expires the control itself.
+    from kiro_crew.dashboard.chat_utils import expire_slack_options
+
+    await expire_slack_options(get_dashboard_state(), session_key)
 
     # ── Hook: auto-reply before touching the LLM (mirrors native) ──
     # A HOOK_REPLY from the context builder's hooks short-circuits the turn: post
@@ -334,6 +343,21 @@ async def handle_message_transport(
         # to the outer except and double-record the turn as a failure.
         sessions.record_success(session_key)
         Stats().inc_message_success()
+
+        # Remember this turn's OPTIONS control, if it posted one, so the next
+        # turn on this thread can strike it through.
+        try:
+            from kiro_crew.dashboard.chat_utils import remember_slack_options
+
+            remember_slack_options(
+                get_dashboard_state(), session_key, renderer.posted_options
+            )
+        except Exception:
+            logger.debug(
+                "transport_dispatch: failed to record OPTIONS control session=%s",
+                session_key,
+                exc_info=True,
+            )
 
         try:
             sessions.check_context_usage(session_key, client)

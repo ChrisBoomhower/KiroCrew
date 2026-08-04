@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from kiro_crew.providers.base import LLMEvent
+    from kiro_crew.slack.outbound import PostedOptions
 
 from kiro_crew.dashboard.state import (
     CRON_NOTIFY_PREFIX,
@@ -445,6 +446,128 @@ def effective_session_key(slot: _ChatSlot) -> str:
     with no slot in hand.
     """
     return getattr(slot, "linked_session_key", "") or _history_key_for(slot.key)
+
+
+def slack_options_slot(state: DashboardState, session_key: str) -> _ChatSlot | None:
+    """The slot holding *session_key*'s Slack OPTIONS state, if one exists.
+
+    Deliberately not routed through :func:`dashboard_slot_key`, which answers
+    "is a tab open?". A slot can hold OPTIONS state with no tab currently open,
+    and one lookup reaches both flavours of slot: a channel-born slot
+    (``slack_<ts>``) and a dashboard slot mirroring out to Slack
+    (``chat-<n>-<epoch>``) both live in the same registry.
+
+    Returns None rather than raising for any state object that cannot answer the
+    question. OPTIONS bookkeeping is best-effort cleanup and must never be able
+    to abort the turn that triggered it.
+    """
+    getter = getattr(state, "get_slot", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(_normalize_slot_key(session_key))
+    except Exception:
+        logger.debug("Slack OPTIONS slot lookup failed", exc_info=True)
+        return None
+
+
+def slack_options_session_keys(state: DashboardState | None, thread_ts: str) -> list[str]:
+    """Every session key under which *thread_ts*'s OPTIONS control may be recorded.
+
+    One Slack thread belongs to one conversation, but that conversation is
+    addressed by two different keys depending on which side owns it: a
+    Slack-born session is ``slack:<ts>``, while a dashboard session mirroring
+    out to the thread is ``dashboard:<slot>``. A caller holding only the thread
+    timestamp cannot tell which, so return both candidates — they name the same
+    conversation, so acting on both is correct rather than merely safe.
+    """
+    if not thread_ts:
+        return []
+    from kiro_crew.messaging.link import canonical_key
+
+    keys = [canonical_key(thread_ts)]
+    linked = getattr(state, "get_linked_slot", None)
+    if callable(linked):
+        try:
+            slot = linked(thread_ts)
+        except Exception:
+            slot = None
+        if slot is not None:
+            mirrored = effective_session_key(slot)
+            if mirrored and mirrored not in keys:
+                keys.append(mirrored)
+    return keys
+
+
+def remember_slack_options(
+    state: DashboardState | None,
+    session_key: str,
+    posted: PostedOptions | None,
+) -> None:
+    """Record the live OPTIONS control just posted for *session_key*.
+
+    A no-op when there is no control, no dashboard state, or no slot yet — a
+    Slack thread can be mid-turn before its slot exists, and failing to record
+    only means that control is not struck through later.
+    """
+    if posted is None or state is None or not session_key:
+        return
+    slot = slack_options_slot(state, session_key)
+    if slot is not None:
+        slot._slack_options_posted = posted
+
+
+def forget_slack_options(state: DashboardState | None, session_key: str) -> None:
+    """Drop the recorded control for *session_key* without editing Slack.
+
+    For when something else has already spent the control — a Send click
+    re-renders the message with the user's selection, and striking every choice
+    through afterwards would erase the choice they made.
+    """
+    if state is None or not session_key:
+        return
+    slot = slack_options_slot(state, session_key)
+    if slot is not None:
+        slot._slack_options_posted = None
+
+
+def forget_slack_options_for_thread(state: DashboardState | None, thread_ts: str) -> None:
+    """Drop the recorded control for the conversation living in *thread_ts*.
+
+    For callers that hold a Slack thread timestamp rather than a session key —
+    the interaction handlers, which see a click on a message and not the session
+    behind it. Clears every key the thread's conversation can be recorded under,
+    so a control posted by the dashboard mirror is forgotten too.
+    """
+    for key in slack_options_session_keys(state, thread_ts):
+        forget_slack_options(state, key)
+
+
+async def expire_slack_options(state: DashboardState | None, session_key: str) -> None:
+    """Spend the OPTIONS control left from *session_key*'s previous turn.
+
+    Called as a new turn begins, whichever surface it arrives on, so a control
+    the conversation has moved past stops inviting a click that would answer a
+    superseded question.
+
+    Clears the record before editing, so a failing or slow edit is not retried
+    on every later turn.
+    """
+    if state is None or not session_key:
+        return
+    slot = slack_options_slot(state, session_key)
+    if slot is None:
+        return
+    posted = slot._slack_options_posted
+    if posted is None:
+        return
+    slot._slack_options_posted = None
+    slack = getattr(state, "slack_client", None)
+    if slack is None:
+        return
+    from kiro_crew.slack.outbound import expire_options
+
+    await expire_options(slack, posted)
 
 
 _INCOGNITO_PREFIX = (
