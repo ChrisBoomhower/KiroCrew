@@ -330,19 +330,34 @@ async function getMcpServers(): Promise<McpServerRow[]> {
 
 async function discoverMcpTools(
   name: string,
-): Promise<{ tools: { name: string; description?: string }[]; fromCache: boolean } | null> {
+): Promise<{
+  tools: { name: string; description?: string }[]
+  fromCache: boolean
+  errorCode?: string
+} | null> {
+  // Mochi's OWN route, not core's. Core has GET /api/mcp (whole inventory) and
+  // PUT/DELETE on /api/mcp/servers/{name} — no per-server GET, so this used to
+  // resolve the path, miss on method, take a 405, and return null. Same class of
+  // bug as the inventory fetch above.
   try {
-    const res = await fetch(`/api/mcp/servers/${encodeURIComponent(name)}`, {
+    const res = await fetch(`/api/apps/mochi/mcp-tools/${encodeURIComponent(name)}`, {
       credentials: 'same-origin',
     })
-    if (!res.ok) return null
-    const body = (await res.json()) as {
+    const body = (await res.json().catch(() => ({}))) as {
       tools?: { name: string; description?: string }[]
       cached?: boolean
+      code?: string
+    }
+    // Report a CODE, never the server's prose: the panel renders in 10 locales,
+    // so an English `error` string (or a raw "HTTP 405") is untranslatable at the
+    // point of display. The backend already emits a machine-readable `code` for
+    // exactly this; fall back to a synthetic one so the panel always has a key.
+    if (!res.ok) {
+      return { tools: [], fromCache: false, errorCode: body.code || `http_${res.status}` }
     }
     return { tools: body.tools ?? [], fromCache: body.cached === true }
   } catch {
-    return null
+    return { tools: [], fromCache: false, errorCode: 'network' }
   }
 }
 

@@ -614,6 +614,77 @@ async def _handle_pack_detail(request: web.Request) -> web.Response:
     return web.json_response(detail)
 
 
+#: Names currently being probed, so click-spam on "discover tools" cannot spawn
+#: one server process per click. Core guards its whole-inventory probe the same
+#: way (`handlers/mcp.py::_mcp_probe_in_progress`); this is the per-name form,
+#: because here the name comes from the request rather than from the config.
+_mcp_probe_inflight: set[str] = set()
+
+
+async def _handle_mcp_tools_get(request: web.Request) -> web.Response:
+    """GET /api/apps/mochi/mcp-tools/{name} — tools for ONE MCP server.
+
+    Backs the settings panel's "discover tools" action. Core exposes the whole
+    inventory as ``GET /api/mcp`` and register/remove as PUT/DELETE on
+    ``/api/mcp/servers/{name}``, but never a per-server GET — so the panel's
+    fetch resolved that path, missed on method, and took a 405. Both the api
+    helper and the click handler swallow failures, so the button did nothing at
+    all, visibly or in a log.
+
+    Probing lives here rather than in a new core route because the inventory is
+    already reachable from the app: ``mcp_discovery`` is public API, and
+    ``probe_server`` writes through to the same cache ``GET /api/mcp`` reads, so
+    a discover here also freshens the core view.
+    """
+    from kiro_crew.mcp_discovery import list_servers, probe_server
+
+    name = (request.match_info.get("name") or "").strip()
+    if not name:
+        return web.json_response(
+            {"error": "server name is required", "code": "invalid_name"}, status=400
+        )
+
+    # Config read touches the filesystem across every MCP scope — off the loop.
+    servers = await asyncio.to_thread(list_servers)
+    server = next((s for s in servers if s.name == name), None)
+    if server is None:
+        return web.json_response(
+            {"error": "unknown MCP server", "code": "server_not_found"}, status=404
+        )
+
+    # A consent-disabled row must NEVER be probed: probing SPAWNS the server, and
+    # the user has not agreed to run it. ``probe_all`` filters these out before
+    # it ever calls ``probe_server`` (see mcp_discovery.probe_all's docstring),
+    # and ``probe_server`` itself does NOT enforce it — so this per-server entry
+    # point has to repeat the check or it becomes a way around the consent gate.
+    if getattr(server, "disabled", False):
+        return web.json_response(
+            {"error": "MCP server is disabled", "code": "server_disabled"}, status=409
+        )
+
+    if name in _mcp_probe_inflight:
+        return web.json_response(
+            {"error": "probe already running", "code": "probe_in_progress"}, status=409
+        )
+    _mcp_probe_inflight.add(name)
+    try:
+        probed = await probe_server(server)
+    finally:
+        _mcp_probe_inflight.discard(name)
+
+    # ``McpServerInfo.tools`` is a list of NAMES; the panel's row renderer takes
+    # objects so a description can be added later without a shape change.
+    return web.json_response(
+        {
+            "name": probed.name,
+            "tools": [{"name": tool} for tool in probed.tools],
+            "status": probed.status,
+            "error": probed.error,
+            "cached": False,
+        }
+    )
+
+
 #: Content types for the file kinds a pack may hold. Keys must stay in step with
 #: ``appearance_store._ALLOWED_SUFFIXES`` — that is what may be IN a pack, this
 #: is how it is served back. A hardcoded image/png here mislabelled every
@@ -787,6 +858,9 @@ def register_routes(app: web.Application) -> None:
     app.router.add_get(f"{_BASE}/packs/{{pack_id}}/file/{{filename}}", _handle_pack_file)
     app.router.add_get(f"{_BASE}/petdex/installed", _handle_petdex_installed)
     app.router.add_post(f"{_BASE}/petdex/import", _handle_petdex_import)
+    app.router.add_get(
+        f"{_BASE}/mcp-tools/{{name}}", _require_enabled(_handle_mcp_tools_get)
+    )
 
 
 # ── Movement reports ───────────────────────────────────────────────────────

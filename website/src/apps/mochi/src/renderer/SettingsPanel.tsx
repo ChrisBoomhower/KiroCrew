@@ -689,6 +689,22 @@ const MOOD_COLORS: Record<string, string> = {
   neutral: '#a1a1aa',
 }
 
+/**
+ * Map a discover-tools failure CODE to a translated message.
+ *
+ * The backend's `code` is the contract; its English `error` prose is for logs.
+ * Anything unrecognised (including a synthetic `http_405` / `network`) falls back
+ * to one generic translated line, so no locale ever sees a raw code or HTTP status.
+ */
+function mcpErrorText(code: string): string {
+  const key = ({
+    server_disabled: 'mcp_error_disabled',
+    probe_in_progress: 'mcp_error_in_progress',
+    server_not_found: 'mcp_error_not_found',
+  } as Record<string, string>)[code] || 'mcp_error_generic'
+  return i18nT(`apps.mochi.settingsPanel.${key}`)
+}
+
 function moodColor(mood: string): string {
   return MOOD_COLORS[mood] ?? 'var(--accent)'
 }
@@ -891,7 +907,7 @@ const McpSection: React.FC<{
   const [loading, setLoading] = React.useState(true)
   const [expanded, setExpanded] = React.useState<string | null>(null)
   const [activeTab, setActiveTab] = React.useState<Record<string, 'chat' | 'bg'>>({})
-  const [toolsMap, setToolsMap] = React.useState<Record<string, { tools: Array<{ name: string; description?: string }>; fromCache: boolean }>>({})
+  const [toolsMap, setToolsMap] = React.useState<Record<string, { tools: Array<{ name: string; description?: string }>; fromCache: boolean; errorCode?: string }>>({})
   const [refreshing, setRefreshing] = React.useState<string | null>(null)
   const [stagedConfigs, setStagedConfigs] = React.useState<Record<string, { agents: ('chat' | 'bg')[]; autoApprove: string[]; disabledTools: string[] }>>({})
 
@@ -1021,6 +1037,15 @@ const McpSection: React.FC<{
             opacity: refreshing === s.name ? 0.5 : 1,
           }}>{refreshing === s.name ? i18nT('apps.mochi.settingsPanel.mcp_refreshing') : i18nT('apps.mochi.settingsPanel.mcp_refresh_tools')}</button>
           {toolData?.fromCache && <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>{i18nT('apps.mochi.settingsPanel.mcp_from_cache')}</span>}
+          {/* A failed discover used to be indistinguishable from a server with no
+              tools, which is how a 405 on this button went unnoticed. role=status
+              so the async failure is ANNOUNCED — sighted-only feedback would leave
+              AT users with the same silence this fix set out to break. */}
+          {toolData?.errorCode && (
+            <span role="status" style={{ fontSize: 11, color: 'var(--danger, #e5484d)' }}>
+              {mcpErrorText(toolData.errorCode)}
+            </span>
+          )}
         </div>
         {/* Tool lists */}
         {!toolData && <div style={{ fontSize: 10, color: 'var(--text-muted)', marginTop: 4 }}>{i18nT('apps.mochi.settingsPanel.mcp_no_tools')}</div>}
