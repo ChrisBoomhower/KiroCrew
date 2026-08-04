@@ -41,6 +41,10 @@ SYSTEM_CHANNELS: dict[str, str] = {
     "system.approval": "critical",
     "system.subagent": "passive",
     "system.taskrunner": _DEFAULT_PRIORITY,
+    # A staged skill candidate is invisible until a human approves it, so the
+    # note is the ONLY surface that says it exists -- but it blocks no agent
+    # turn, so it is default, not critical.
+    "system.skills": _DEFAULT_PRIORITY,
 }
 
 # Fallback channel for legacy kinds that have no dedicated system channel
@@ -223,7 +227,13 @@ class NotificationPayload:
 
 
 def payload_from_legacy(
-    kind: str, title: str, body: str, meta: dict[str, Any] | None = None
+    kind: str,
+    title: str,
+    body: str,
+    meta: dict[str, Any] | None = None,
+    *,
+    url: str | None = None,
+    actions: list[dict[str, Any]] | None = None,
 ) -> NotificationPayload:
     """Build a v2 payload from the legacy ``notify(kind, ...)`` call shape.
 
@@ -232,6 +242,17 @@ def payload_from_legacy(
     titles/bodies are truncated, an empty title gets a placeholder, and the
     original ``kind`` is preserved verbatim even when it has no dedicated
     system channel (the frontend filters on ``note.kind``).
+
+    ``url``/``actions`` are the ONLY way a legacy caller can produce a
+    navigable note. They are deliberately keyword arguments on the schema
+    fields rather than ``meta`` keys: ``_RESERVED_NOTE_KEYS`` drops those two
+    names during the meta merge (so meta cannot smuggle an unvalidated deep
+    link), which means a ``meta={"url": ...}`` caller silently shipped a note
+    with no Open button and no action capsule. Routing them here puts them
+    through :meth:`NotificationPayload.validate` instead, so they are
+    path-validated rather than discarded. Unlike the title/body repairs above
+    these do NOT repair: an invalid deep link raises, because a button that
+    navigates somewhere unintended is worse than no button.
     """
     channel = f"system.{kind}"
     if channel not in SYSTEM_CHANNELS:
@@ -254,6 +275,8 @@ def payload_from_legacy(
         title=title,
         body=body,
         kind=kind,
+        url=url,
+        actions=actions,
         meta=dict(meta) if meta else {},
     )
 
