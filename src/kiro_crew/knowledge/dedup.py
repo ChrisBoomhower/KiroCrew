@@ -15,12 +15,14 @@ Priority (which copy survives): a persistent source (a folder / obsidian_vault /
 within a class the newest ``mtime`` wins; on an ``mtime`` tie the oldest-resident copy
 wins (stable, deterministic).
 
-Action: the losing document is hard-deleted (its KB entry, chunk rows, and -- for a
-whole-source doc -- its source row). The underlying file on disk is never touched.
+Action: the losing DOCUMENT is hard-deleted (its KB entry and chunk rows). Never a
+source row -- a source may hold many documents, so deleting one would take the rest
+with it. The underlying file on disk is never touched.
 
-Granularity: a "document" is one folder file (a ``folder_file_state`` row) for folder
-sources, or the whole source for upload/chat sources. All chunk rows of a document
-share one ``content_hash``.
+Granularity: the unit is always one document -- a ``folder_file_state`` row for folder
+sources, and one content-hash group of ``items`` for everything else (uploads, chat
+captures, and the aggregate artifact / agent-added sources, which hold many documents
+each). All chunk rows of a document share one ``content_hash``.
 """
 
 from __future__ import annotations
@@ -44,17 +46,6 @@ logger = logging.getLogger(__name__)
 # document exists in both. A file-backed artifact source will join this set when
 # that source type lands.
 PERSISTENT_SOURCE_TYPES = frozenset({"local_folder", "obsidian_vault", "quip"})
-
-# Aggregate sources bundle MANY logical documents under ONE sources row
-# (auto-ingested artifacts store every artifact's chunks under a single
-# source_type="artifact", file_path=None row, grouped per-slug only in
-# artifact_item_state). They must NOT be treated as one whole-source dedup unit:
-# _build_doc would hash only the FIRST item, and a single artifact matching a
-# watched folder file would make the aggregate the dedup loser, so
-# _delete_doc -> delete_source_cascade would wipe EVERY artifact's KB entry.
-# Excluding them from enumerate_docs is the surgical fix (per-slug dedup is a
-# larger follow-up).
-_AGGREGATE_SOURCE_TYPES = frozenset({"artifact"})
 
 # Tier-2 fuzzy match floor. Validated against a live KB: true duplicates and
 # version-drift copies land at cosine >= 0.95, while same-topic-but-different docs
@@ -136,7 +127,15 @@ class DocRef:
 
     @property
     def key(self) -> tuple[str, str]:
-        return (self.source_id, self.file_path or "")
+        """Identity within the corpus, used for the collapse bookkeeping.
+
+        The second element must distinguish DOCUMENTS, not sources: a document
+        without a file path is identified by its content hash. Falling back to
+        ``""`` for those would give every document in one source the same key, so
+        removing one would mark them all removed and protect them all from
+        deletion.
+        """
+        return (self.source_id, self.file_path or self.content_hash or "")
 
 
 def normalize_filename(name: str) -> str:
@@ -299,8 +298,38 @@ def _build_doc(store, *, source_id, source_type, filename, item_ids, file_path,
         recency=recency or 0.0, resident_since=resident_since, file_path=file_path)
 
 
+def _doc_labels(store) -> dict[str, str]:
+    """``item_id -> document display name`` for aggregate-source documents.
+
+    An aggregate source's name ("Artifacts", "Auto-added") says nothing about
+    which document a chunk belongs to, and the fuzzy tier gates on the filename,
+    so the per-document name recorded in the item-state tables is what has to be
+    carried. Keyed by item id rather than by content hash on purpose: the state
+    tables hash the text as submitted, while ``items.content_hash`` hashes the
+    reader's OUTPUT, and those differ whenever the reader transforms the input
+    (html prose extraction). Item ids are exact either way.
+    """
+    labels: dict[str, str] = {}
+    for table in ("artifact_item_state", "agent_item_state"):
+        try:
+            rows = store.db.execute(
+                f"SELECT item_ids, name FROM {table}").fetchall()  # noqa: S608
+        except Exception:
+            continue
+        for r in rows:
+            if not r["name"]:
+                continue
+            try:
+                ids = json.loads(r["item_ids"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            for iid in ids:
+                labels[iid] = r["name"]
+    return labels
+
+
 def enumerate_docs(store) -> list[DocRef]:
-    """Build the de-dup unit list: one DocRef per folder file, one per non-folder source."""
+    """Build the de-dup unit list: one DocRef per DOCUMENT."""
     docs: list[DocRef] = []
     folder_source_ids: set[str] = set()
     folder_rows = store.db.execute(
@@ -317,20 +346,33 @@ def enumerate_docs(store) -> list[DocRef]:
         if doc:
             docs.append(doc)
 
-    for s in store.db.execute(
-            "SELECT id, name, source_type, updated_at FROM sources").fetchall():
-        if s["id"] in folder_source_ids:
+    # Every other source type: one DocRef per DOCUMENT, grouped by the
+    # whole-document content_hash that every chunk of a document carries.
+    #
+    # A source is not a dedup unit. For an aggregate source (artifacts,
+    # agent-added) one unit per source carries only its FIRST item's hash, so a
+    # match makes the whole library the loser and cascade-deletes every document
+    # in it -- and the carve-out that would guard against that costs those
+    # documents any de-duplication at all. With no source-level unit, no guard is
+    # needed and every source type behaves the same way.
+    labels = _doc_labels(store)
+    rows = store.db.execute(
+        "SELECT i.source_id, s.source_type, s.name AS source_name, s.updated_at, "
+        "group_concat(i.id) AS item_ids "
+        "FROM items i JOIN sources s ON s.id = i.source_id "
+        "WHERE i.content_hash IS NOT NULL AND i.content_hash != '' "
+        "GROUP BY i.source_id, i.content_hash").fetchall()
+    for r in rows:
+        if r["source_id"] in folder_source_ids:
             continue  # its documents are enumerated per-file above
-        if s["source_type"] in _AGGREGATE_SOURCE_TYPES:
-            # Aggregate row bundling many artifacts — a single whole-source
-            # DocRef here risks delete_source_cascade wiping them all.
+        item_ids = [i for i in (r["item_ids"] or "").split(",") if i]
+        if not item_ids:
             continue
-        item_ids = [r["id"] for r in store.db.execute(
-            "SELECT id FROM items WHERE source_id = ?", (s["id"],)).fetchall()]
+        filename = next((labels[i] for i in item_ids if i in labels), r["source_name"])
         doc = _build_doc(
-            store, source_id=s["id"], source_type=s["source_type"],
-            filename=s["name"], item_ids=item_ids, file_path=None,
-            recency=_iso_to_epoch(s["updated_at"]))
+            store, source_id=r["source_id"], source_type=r["source_type"],
+            filename=filename, item_ids=item_ids, file_path=None,
+            recency=_iso_to_epoch(r["updated_at"]))
         if doc:
             docs.append(doc)
     return docs
@@ -400,6 +442,12 @@ def _match_reason(store, a: DocRef, b: DocRef, threshold: float) -> str | None:
     """Return "exact" / "fuzzy:<cosine>" if a and b are duplicate documents, else None."""
     if a.key == b.key:
         return None
+    # Two references to ONE physical item set are not two documents. Their keys can
+    # differ (the first element is the source), so the key test above does not catch
+    # it, and their hashes are necessarily equal because both were read from the same
+    # rows -- an exact match whose collapse would delete the surviving copy's items.
+    if set(a.item_ids) & set(b.item_ids):
+        return None
     if a.content_hash and b.content_hash and a.content_hash == b.content_hash:
         return "exact"
     if not filename_near_match(a.filename, b.filename):
@@ -451,31 +499,112 @@ def find_duplicates(store, docs: list[DocRef], threshold: float) -> list[DedupAc
     return actions
 
 
-def _delete_doc(store, doc: DocRef) -> None:
-    """Hard-delete a losing document's KB entry. Never touches the file on disk."""
-    if doc.source_type in _AGGREGATE_SOURCE_TYPES:
-        # Belt-and-suspenders: never cascade-delete an aggregate source (it
-        # bundles many artifacts). enumerate_docs already excludes these, but a
-        # future caller building a DocRef directly must not be able to wipe the
-        # whole Artifacts library because one artifact duplicated a folder file.
-        logger.warning(
-            "dedup: refusing to delete aggregate source %s (type=%s)",
-            doc.source_id, doc.source_type)
-        return
-    if doc.file_path is None:
-        # Whole-source document (upload / chat / manual): remove its source + items.
-        store.delete_source_cascade(doc.source_id)
-    else:
-        # One file within a folder source: drop its items, but KEEP the
-        # folder_file_state row marked 'deduped' (empty item_ids). The file is still
-        # on disk, so deleting the row would make the next scan treat it as new and
-        # re-ingest -> re-dedup it every cycle. The watcher skips 'deduped' files.
-        store.delete_items_batch(doc.item_ids)
+def _source_is_now_empty(store, source_id: str) -> bool:
+    """True when nothing is left in *source_id* -- no items, no document state.
+
+    Decides whether the source row itself is now meaningless. A folder or
+    vault source is never empty in this sense: the row is user-registered
+    configuration and a watched folder with no matching files is legitimately
+    empty, not orphaned.
+
+    Answers False on any read error rather than propagating. The caller has
+    already committed a document's item deletion by this point, so raising here
+    would abort the sweep mid-collapse and leave the audit event unwritten; a
+    source that keeps an empty row is the strictly safer failure.
+    """
+    try:
+        row = store.db.execute(
+            "SELECT source_type FROM sources WHERE id = ?", (source_id,)).fetchone()
+        if not row or row["source_type"] in PERSISTENT_SOURCE_TYPES:
+            return False
+        if store.db.execute(
+                "SELECT 1 FROM items WHERE source_id = ? LIMIT 1",
+                (source_id,)).fetchone():
+            return False
+        # A source that OWNS no items can still HOLD documents: after a collapse it
+        # is a location of the surviving copy. Cascade-deleting it here would drop
+        # that location row and leave the document reachable from one source again,
+        # so deleting the other one would destroy it.
+        if store.db.execute(
+                "SELECT 1 FROM source_locations WHERE source_id = ? LIMIT 1",
+                (source_id,)).fetchone():
+            return False
+        for table in ("folder_file_state", "artifact_item_state", "agent_item_state"):
+            if store.db.execute(
+                    f"SELECT 1 FROM {table} WHERE source_id = ? LIMIT 1",  # noqa: S608
+                    (source_id,)).fetchone():
+                return False
+    except Exception:
+        logger.debug("dedup: could not determine whether source %s is empty",
+                     source_id, exc_info=True)
+        return False
+    return True
+
+
+def _collapse_doc(store, loser: DocRef, winner: DocRef) -> None:
+    """Collapse a duplicate DOCUMENT onto the copy that won. Never a file on disk.
+
+    One document, several locations. The winner's items are the single stored copy;
+    the loser's source becomes a LOCATION of them, so the document stays reachable
+    from both and deleting either source leaves it intact (``delete_source_cascade``
+    re-points ownership rather than destroying an item another source holds).
+
+    The loser's own items go, because they are a redundant second copy of the same
+    text -- keeping them would return the document twice in search, which has no
+    result-collapse step. What is recorded instead is the RELATIONSHIP:
+    ``merged_into_source_id`` names the winner's source, so deleting the winner can
+    clear the marker and let this document be ingested again.
+
+    The marker is a source id and never the winner's item ids. ``item_ids`` means
+    "the items this row owns", and dedup derives a document's hash and embedding from
+    whatever it points at -- so a row naming the winner's items would be enumerated
+    as a second document over one physical item set, and collapsing that pair would
+    delete the surviving copy.
+
+    A source is still removed once provably empty -- no items and no document-state
+    rows -- which keeps a one-shot upload from lingering as an empty row in the
+    Sources UI. A source that still holds documents is never touched.
+    """
+    # Attach BEFORE deleting: the winner's items must already be reachable from the
+    # loser's source when the loser's copy goes, or a crash between the two steps
+    # loses the document.
+    for item_id in winner.item_ids:
+        store.add_source_location(item_id, loser.source_id)
+
+    store.delete_items_batch(loser.item_ids, owner_source_id=loser.source_id)
+    if loser.file_path is not None:
         store.db.execute(
-            "UPDATE folder_file_state SET status = 'deduped', item_ids = '[]' "
-            "WHERE source_id = ? AND file_path = ?",
-            (doc.source_id, doc.file_path))
+            "UPDATE folder_file_state SET status = 'deduped', item_ids = '[]', "
+            "merged_into_source_id = ? WHERE source_id = ? AND file_path = ?",
+            (winner.source_id, loser.source_id, loser.file_path))
         store.db.commit()
+        return
+    for table in ("artifact_item_state", "agent_item_state"):
+        try:
+            rows = store.db.execute(
+                f"SELECT slug, item_ids FROM {table} WHERE source_id = ?",  # noqa: S608
+                (loser.source_id,)).fetchall()
+        except Exception:
+            # The item deletion above is already committed, so raising here would
+            # abort the sweep mid-collapse. Skipping one marker table costs a
+            # re-ingest on the next pass; an exception costs the whole sweep.
+            logger.debug("dedup: could not read %s for source %s", table,
+                         loser.source_id, exc_info=True)
+            continue
+        for r in rows:
+            try:
+                ids = json.loads(r["item_ids"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            if not ids or not set(ids) & set(loser.item_ids):
+                continue
+            store.db.execute(
+                f"UPDATE {table} SET status = 'deduped', item_ids = '[]', "  # noqa: S608
+                "merged_into_source_id = ? WHERE source_id = ? AND slug = ?",
+                (winner.source_id, loser.source_id, r["slug"]))
+    store.db.commit()
+    if _source_is_now_empty(store, loser.source_id):
+        store.delete_source_cascade(loser.source_id)
 
 
 def _action_dict(action: DedupAction) -> dict:
@@ -524,26 +653,27 @@ def dedup_sweep(store, *, threshold: float = DEFAULT_FUZZY_THRESHOLD,
     results = [_action_dict(a) for a in actions]
     if apply:
         for action in actions:
-            _delete_doc(store, action.loser)
+            _collapse_doc(store, action.loser, action.winner)
             _audit_collapse(action)
     return results
 
 
-def _build_doc_for(store, source_id: str, file_path: str | None) -> DocRef | None:
-    """Build the DocRef for a single just-ingested document."""
+def _build_doc_for(store, source_id: str, file_path: str | None,
+                   content_hash: str | None = None) -> DocRef | None:
+    """Build the DocRef for a single just-ingested document.
+
+    Identified by *file_path* for a folder source, else by *content_hash* -- the
+    caller knows which document it just wrote, so it says so. Falling back to
+    "the whole source" misrepresents any source holding more than one document:
+    its hash would be whichever item came back first, and a pair it won
+    hard-deleted a legitimate copy against a hash describing a different
+    document. With neither given, the newest document in the source is used,
+    which is only a guess and exists for the manual CLI path.
+    """
     s = store.db.execute(
         "SELECT name, source_type, updated_at FROM sources WHERE id = ?",
         (source_id,)).fetchone()
     if not s:
-        return None
-    # Aggregate sources are not dedup units (see enumerate_docs): a whole-
-    # aggregate DocRef keyed on the first item's hash misrepresents the many
-    # artifacts inside. Without this, every artifact save produced phantom
-    # DedupActions that _delete_doc silently refused — and if the aggregate
-    # ever WON a pair, a legitimate upload was hard-deleted against a hash
-    # representing one artifact out of many. Per-item file_path builds are
-    # fine; it is only the whole-source build that lies about identity.
-    if file_path is None and s["source_type"] in _AGGREGATE_SOURCE_TYPES:
         return None
     if file_path is not None:
         row = store.db.execute(
@@ -556,14 +686,28 @@ def _build_doc_for(store, source_id: str, file_path: str | None) -> DocRef | Non
             filename=file_path.rsplit("/", 1)[-1],
             item_ids=json.loads(row["item_ids"] or "[]"),
             file_path=file_path, recency=row["mtime"])
+    if not content_hash:
+        row = store.db.execute(
+            "SELECT content_hash FROM items WHERE source_id = ? "
+            "AND content_hash IS NOT NULL AND content_hash != '' "
+            "ORDER BY created_at DESC, rowid DESC LIMIT 1", (source_id,)).fetchone()
+        if not row:
+            return None
+        content_hash = row["content_hash"]
     item_ids = [r["id"] for r in store.db.execute(
-        "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()]
+        "SELECT id FROM items WHERE source_id = ? AND content_hash = ?",
+        (source_id, content_hash)).fetchall()]
+    if not item_ids:
+        return None
+    labels = _doc_labels(store)
+    filename = next((labels[i] for i in item_ids if i in labels), s["name"])
     return _build_doc(
-        store, source_id=source_id, source_type=s["source_type"], filename=s["name"],
+        store, source_id=source_id, source_type=s["source_type"], filename=filename,
         item_ids=item_ids, file_path=None, recency=_iso_to_epoch(s["updated_at"]))
 
 
 def dedup_document(store, source_id: str, *, file_path: str | None = None,
+                   content_hash: str | None = None,
                    threshold: float = DEFAULT_FUZZY_THRESHOLD,
                    apply: bool = False) -> list[dict]:
     """Dedup one just-ingested document against the existing corpus.
@@ -572,8 +716,12 @@ def dedup_document(store, source_id: str, *, file_path: str | None = None,
     the O(n^2) ``dedup_sweep`` used for the one-time backfill. A Tier-1 exact match
     keys off the indexed ``content_hash``; Tier-2 compares the new document's embedding
     against the others. Returns the collapse actions that involved this document.
+
+    Identify the document with *file_path* (folder sources) or *content_hash*
+    (everything else). A source id alone is not enough when the source holds more
+    than one document.
     """
-    new_doc = _build_doc_for(store, source_id, file_path)
+    new_doc = _build_doc_for(store, source_id, file_path, content_hash)
     if new_doc is None:
         return []
     results: list[dict] = []
@@ -592,7 +740,7 @@ def dedup_document(store, source_id: str, *, file_path: str | None = None,
         action = DedupAction(winner=winner, loser=loser, reason=reason)
         results.append(_action_dict(action))
         if apply:
-            _delete_doc(store, loser)
+            _collapse_doc(store, loser, winner)
             _audit_collapse(action)
         if loser.key == new_doc.key:
             break  # the new document itself was collapsed; stop comparing

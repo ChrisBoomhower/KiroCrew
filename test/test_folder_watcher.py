@@ -485,7 +485,7 @@ class TestIngestFileSecurity:
         with patch("kiro_crew.knowledge.folder_watcher.is_sensitive_path", return_value=True):
             result = await fw._ingest_file(str(f), source_id, "default", {}, [])
 
-        assert result is None
+        assert result == (None, "failed")
         # Should record as failed
         row = store.db.execute(
             "SELECT status, error_message FROM folder_file_state WHERE source_id = ? AND file_path = ?",

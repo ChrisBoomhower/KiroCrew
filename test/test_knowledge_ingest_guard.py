@@ -180,9 +180,9 @@ class TestChunkingOffLoop:
         seen: list[int] = []
         real = pipeline._maybe_dedup
 
-        def _spy(source_id):
+        def _spy(source_id, content_hash=""):
             seen.append(threading.get_ident())
-            return real(source_id)
+            return real(source_id, content_hash)
 
         pipeline._maybe_dedup = _spy  # type: ignore[method-assign]
         await pipeline.ingest_text("some body text", title="t")
@@ -409,3 +409,77 @@ class TestChunkPropsCoercion:
         assert built, "per-source chunker was not built"
         assert built[-1].target_size == 128
         assert built[-1].overlap == 7
+
+
+def test_persistent_source_outranks_a_transient_holder(tmp_path):
+    """A folder copy must be allowed to land when only an upload holds the content.
+
+    The gate honours the same persistent-over-transient ranking as ``pick_winner``,
+    so arrival order cannot leave the only searchable copy inside a transient
+    upload whose deletion would take the content with it.
+    """
+    from kiro_crew.knowledge.ingestion import IngestionPipeline
+    from kiro_crew.knowledge.store import KnowledgeStore
+
+    store = KnowledgeStore(str(tmp_path / "k.db"))
+    try:
+        pipe = IngestionPipeline(store=store, extractor=MagicMock(),
+                                 chunker=MagicMock(), reader=MagicMock(),
+                                 embedder=None)
+        upload = store.add_source(name="dropped.md", source_type="upload",
+                                  uri="upload://dropped.md")
+        folder = store.add_source(name="notes", source_type="local_folder",
+                                  uri=str(tmp_path / "notes"))
+        h = "f" * 64
+        store.db.execute(
+            "INSERT INTO items (id, source_id, title, content, item_type, "
+            "content_hash, created_at, updated_at) VALUES ('i1', ?, "
+            "'dropped.md', 'body', 'document', ?, '2024-01-01T00:00:00', "
+            "'2024-01-01T00:00:00')", (upload, h))
+        store.db.commit()
+
+        # Incoming folder copy outranks the transient upload -> write proceeds.
+        assert pipe._skip_as_duplicate(h, folder) is None
+
+        # Reverse direction still refuses: a transient copy adds nothing.
+        assert pipe._skip_as_duplicate(h, upload) is None  # same source, not a dup
+        other_upload = store.add_source(name="again.md", source_type="upload",
+                                        uri="upload://again.md")
+        assert pipe._skip_as_duplicate(h, other_upload) is not None
+    finally:
+        store.close()
+
+
+def test_oversized_file_message_redacts_the_caller_supplied_name(tmp_path, monkeypatch, caplog):
+    """An upload's filename is caller-supplied and can carry a credential.
+
+    It reaches a gateway WARNING, a persisted SEL event and the raised error, so
+    the name is redacted at every one of those sinks.
+    """
+    import asyncio
+    import logging
+
+    from kiro_crew.knowledge.ingestion import FileTooLargeError, IngestionPipeline
+    from kiro_crew.knowledge.readers import FileReader
+    from kiro_crew.knowledge.store import KnowledgeStore
+
+    store = KnowledgeStore(str(tmp_path / "k.db"))
+    try:
+        pipe = IngestionPipeline(store=store, extractor=MagicMock(),
+                                 chunker=MagicMock(), reader=FileReader(),
+                                 embedder=None)
+        big = tmp_path / "payload.md"
+        big.write_text("x" * 4096)
+        _set_limit_mb(monkeypatch, 0.001)
+
+        leaky = "report AKIAIOSFODNN7EXAMPLE.md"
+        with caplog.at_level(logging.WARNING):
+            with pytest.raises(FileTooLargeError) as excinfo:
+                asyncio.get_event_loop().run_until_complete(
+                    pipe.ingest_file(str(big), original_name=leaky))
+
+        assert "AKIAIOSFODNN7EXAMPLE" not in str(excinfo.value)
+        assert "REDACTED" in str(excinfo.value)
+        assert "AKIAIOSFODNN7EXAMPLE" not in caplog.text
+    finally:
+        store.close()

@@ -15,6 +15,7 @@ from kiro_crew.security import is_sensitive_path
 from kiro_crew.sel import sel
 
 from .dedup import dedup_document
+from .ingestion import DUPLICATE_JOB_STATUS
 from .readers import FileReader
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,62 @@ DEFAULT_IGNORE_GLOBS: tuple[str, ...] = (
 )
 
 
+def _prop_str_set(value: object) -> set[str]:
+    """Coerce a source property to a set of non-empty strings.
+
+    Source ``properties`` are user-editable JSON, so anything may be in there;
+    a bad value must degrade to "no extra entries", never raise mid-scan.
+    """
+    if not isinstance(value, list):
+        return set()
+    return {v.strip() for v in value if isinstance(v, str) and v.strip()}
+
+
+def _prop_extensions(value: object) -> set[str] | None:
+    """Coerce the ``include_extensions`` property to a lowercased ``.ext`` set.
+
+    ``None`` (property absent, or not a list) means "no allowlist" -- today's
+    behaviour for every source that does not set it. A list means an allowlist,
+    INCLUDING an empty one, which allows nothing. Getting that distinction
+    backwards would silently change what every existing source ingests.
+    """
+    if not isinstance(value, list):
+        return None
+    return {
+        e.strip().lower() if e.strip().startswith(".") else f".{e.strip().lower()}"
+        for e in value
+        if isinstance(e, str) and e.strip()
+    }
+
+
+def _within(candidate: str, base: str) -> bool:
+    """True when *candidate* is *base* or lives underneath it.
+
+    Both sides are normalised (and case-folded where the platform is
+    case-insensitive) before comparison, because ``commonpath`` returns a path in
+    the platform's own separator form: on Windows a ``/``-separated input comes
+    back ``\\``-separated and would never compare equal to the string it was
+    derived from. Normalising both is also what keeps a sibling like
+    ``/repo-evil`` from passing a naive ``startswith`` test against ``/repo``.
+    """
+    if not base:
+        return True
+    norm = os.path.normcase(os.path.normpath(base))
+    try:
+        return os.path.normcase(
+            os.path.commonpath([os.path.normpath(candidate), norm])) == norm
+    except ValueError:
+        # Different drives on Windows -- definitionally not contained.
+        return False
+
+
+def _prop_int(value: object) -> int:
+    """Coerce a non-negative integer source property; 0 when absent or unusable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    return int(value) if value > 0 else 0
+
+
 class FolderWatcher:
     """Recursively scans a directory source, tracks file state, triggers ingestion."""
 
@@ -73,15 +130,21 @@ class FolderWatcher:
         self.pipeline = pipeline
         self._locks: dict[str, asyncio.Lock] = {}
 
-    async def scan_source(self, source: dict) -> dict:
-        """Scan a folder source. Returns {new, changed, deleted, skipped, capped}."""
+    async def scan_source(self, source: dict, *, chunk_budget: int | None = None) -> dict:
+        """Scan a folder source. Returns {new, changed, deleted, skipped, capped}.
+
+        ``chunk_budget`` stops the scan once that many chunks have been ingested
+        in THIS sweep, leaving the rest for later sweeps. It is passed only for
+        auto-registered sources: a folder the user added by hand is a folder they
+        asked for in full, so it keeps the unbounded behaviour.
+        """
         source_id = source["id"]
         if source_id not in self._locks:
             self._locks[source_id] = asyncio.Lock()
         async with self._locks[source_id]:
-            return await self._do_scan(source)
+            return await self._do_scan(source, chunk_budget=chunk_budget)
 
-    async def _do_scan(self, source: dict) -> dict:
+    async def _do_scan(self, source: dict, *, chunk_budget: int | None = None) -> dict:
         source_id = source["id"]
         uri = source["uri"]
         props = json.loads(source.get("properties") or "{}") if isinstance(
@@ -94,18 +157,28 @@ class FolderWatcher:
         max_files = props.get("max_files", DEFAULT_MAX_FILES)
         ignore_patterns = props.get("ignore_patterns", [])
         source_type = source.get("source_type", "local_folder")
-        extra_skip_dirs = SOURCE_TYPE_SKIP_DIRS.get(source_type, set())
+        extra_skip_dirs = SOURCE_TYPE_SKIP_DIRS.get(source_type, set()) | _prop_str_set(
+            props.get("extra_skip_dirs"))
+        include_extensions = _prop_extensions(props.get("include_extensions"))
+        min_file_bytes = _prop_int(props.get("min_file_bytes"))
+        confine_to_root = bool(props.get("confine_to_root"))
 
         # 1. Discover files
-        discovered = await asyncio.to_thread(self._walk, uri, ignore_patterns, extra_skip_dirs)
+        discovered = await asyncio.to_thread(
+            self._walk, uri, ignore_patterns, extra_skip_dirs,
+            include_extensions, min_file_bytes, confine_to_root)
 
         # Capture all discovered paths before cap (for accurate deletion detection)
         all_discovered_paths = {fp for fp, _ in discovered}
 
-        # 2. Enforce cap (newest first)
+        # Newest first, unconditionally: it is the order both the file cap and the
+        # chunk budget need, so the most recently touched documents are the ones
+        # that land when either bound truncates the sweep.
+        discovered.sort(key=lambda f: f[1], reverse=True)
+
+        # 2. Enforce cap
         capped = 0
         if len(discovered) > max_files:
-            discovered.sort(key=lambda f: f[1], reverse=True)  # sort by mtime desc
             capped = len(discovered) - max_files
             discovered = discovered[:max_files]
             logger.warning("Source %s: capped at %d files (%d skipped)", source_id, max_files, capped)
@@ -116,6 +189,7 @@ class FolderWatcher:
 
         stats: dict[str, int] = {"new": 0, "changed": 0, "deleted": 0, "skipped": 0, "capped": capped, "failed": 0}
         ingested_paths: list[str] = []  # files (re)ingested this scan, for targeted dedup
+        chunks_ingested = 0  # against chunk_budget
 
         # 4. Detect deleted files (use full set, not capped set, to avoid false deletions)
         for file_path in list(existing.keys()):
@@ -147,13 +221,21 @@ class FolderWatcher:
 
             state = existing.get(file_path)
 
-            # Skip files marked skipped/failed (user must retry) or deduped (already
-            # collapsed into another source's copy -- don't re-ingest the on-disk file).
-            if state and state.get("status") in ("skipped", "failed", "deduped"):
+            # 'skipped' and 'failed' need the user to act, so they stay out of the
+            # scan until they do.
+            if state and state.get("status") in ("skipped", "failed"):
                 stats["skipped"] += 1
                 continue
 
-            if state and state.get("status") == "done" and mtime <= state.get("mtime", 0):
+            # 'deduped' means the content was already in the Library when this file
+            # was last seen -- a statement about that content, not a defect in the
+            # file, so it is gated on mtime exactly like 'done'. An unchanged file
+            # costs nothing; an edited one is reconsidered and lands if its new
+            # content is unique. Skipping it unconditionally would strand it: the
+            # marker outlives the copy that caused it, so the file could never be
+            # indexed again even after the other copy was deleted.
+            if (state and state.get("status") in ("done", "deduped")
+                    and mtime <= state.get("mtime", 0)):
                 # Unchanged — just update last_seen
                 last_seen_batch.append((now, source_id, file_path))
                 continue
@@ -181,13 +263,34 @@ class FolderWatcher:
             # Mark scanning before processing (crash recovery: scanning = interrupted)
             self._update_state(source_id, file_path, content_hash, mtime, json.dumps(old_ids), now, "scanning")
 
-            item_ids = await self._ingest_file(file_path, source_id, namespace, props, old_ids)
+            item_ids, outcome = await self._ingest_file(
+                file_path, source_id, namespace, props, old_ids)
             if item_ids is None:
                 # Ingestion failed
                 stats["failed"] += 1
+            elif outcome == "deduped":
+                # Refused by the pre-ingest gate: this exact content is already in
+                # the Library under another source. 'deduped' -- the same status the
+                # dedup sweep writes -- records WHY the file has no item group, so a
+                # later scan can tell it apart from an ingest that produced nothing.
+                # The content_hash and mtime are stored with it, which is what lets
+                # an edit bring the file back into the scan.
+                self._update_state(source_id, file_path, content_hash, mtime, "[]", now,
+                                   "deduped", commit=False)
+                stats["skipped"] += 1
             else:
                 self._update_state(source_id, file_path, content_hash, mtime, json.dumps(item_ids), now, "done", commit=False)
                 ingested_paths.append(file_path)
+                if chunk_budget:
+                    chunks_ingested += len(item_ids)
+                    if chunks_ingested >= chunk_budget:
+                        # Stop this sweep. Files not reached simply have no state
+                        # row (or keep their old one), so the next sweep resumes
+                        # from them -- the existing status column already carries
+                        # the resume point and no extra bookkeeping is needed.
+                        stats["chunks"] = chunks_ingested
+                        stats["budget_reached"] = 1
+                        break
 
         self._flush_last_seen(last_seen_batch)
         self.store.db.commit()  # Batch commit for all non-crash-recovery updates
@@ -202,11 +305,39 @@ class FolderWatcher:
                     logger.debug("Per-file dedup skipped for %s", fpath, exc_info=True)
         return stats
 
-    def _walk(self, root: str, ignore_patterns: list[str], extra_skip_dirs: set[str]) -> list[tuple[str, float]]:
-        """Walk directory, return [(file_path, mtime)] for supported files."""
+    def _walk(self, root: str, ignore_patterns: list[str], extra_skip_dirs: set[str],
+              include_extensions: set[str] | None = None,
+              min_size: int = 0,
+              confine_to_root: bool = False) -> list[tuple[str, float]]:
+        """Walk directory, return [(file_path, mtime)] for supported files.
+
+        ``include_extensions`` NARROWS what is taken; it can never widen it. A
+        value of ``None`` means "no extension allowlist" -- every reader-supported
+        extension is taken, which is the behaviour of every source that does not
+        set the property. An EMPTY set means "no extension is allowed", so
+        nothing is taken; the two must not be conflated, or setting the property
+        would silently change what an existing source ingests.
+
+        ``min_size`` drops files below a byte floor, using the ``stat`` this walk
+        already performs for the mtime rather than a second syscall.
+
+        ``confine_to_root`` drops a file whose RESOLVED path lands outside *root*.
+        ``os.walk`` does not descend directory symlinks, but a FILE symlink is
+        followed on open, so a tracked document that is itself a symlink pointing
+        outside the registered root otherwise gets that external file indexed. It is off by default because for a folder the user
+        registered by hand, following a link they put there is their choice; it is
+        on for an auto-registered source, where nobody confirmed the scope and
+        content from outside the registered tree is never what was asked for.
+        """
         supported = FileReader.SUPPORTED
         results = []
         skip_dirs = HARD_SKIP_DIRS | extra_skip_dirs
+        root_real = ""
+        if confine_to_root:
+            try:
+                root_real = str(Path(root).resolve())
+            except OSError:
+                return []
 
         for dirpath, dirnames, filenames in os.walk(root):
             # Prune skip dirs in-place.
@@ -222,22 +353,31 @@ class FolderWatcher:
                 if any(fnmatch(fname.lower(), pat) for pat in DEFAULT_IGNORE_GLOBS):
                     continue
                 rel_path = os.path.join(rel_dir, fname) if rel_dir != "." else fname
-                # Check ignore patterns
-                if any(fnmatch(rel_path, pat) for pat in ignore_patterns):
+                # Patterns are written with "/" separators, so the path has to be
+                # normalized before matching or every pattern containing a
+                # separator silently never matches on Windows.
+                if any(fnmatch(rel_path.replace(os.sep, "/"), pat) for pat in ignore_patterns):
                     continue
                 # Extension filter
                 ext = Path(fname).suffix.lower()
                 if ext not in supported and ext != ".canvas":
                     continue
+                if include_extensions is not None and ext not in include_extensions:
+                    continue
                 full_path = os.path.join(dirpath, fname)
                 resolved = str(Path(full_path).resolve())
                 if is_sensitive_path(resolved):
                     continue
+                if confine_to_root and not _within(resolved, root_real):
+                    logger.debug("Skipping %s: resolves outside %s", full_path, root_real)
+                    continue
                 try:
-                    mtime = os.stat(full_path).st_mtime
+                    st = os.stat(full_path)
                 except OSError:
                     continue
-                results.append((full_path, mtime))
+                if min_size and st.st_size < min_size:
+                    continue
+                results.append((full_path, st.st_mtime))
 
         return results
 
@@ -292,15 +432,25 @@ class FolderWatcher:
         """Archive items for a deleted file and remove state row."""
         item_ids = json.loads(state.get("item_ids", "[]"))
         if item_ids:
-            self.store.delete_items_batch(item_ids)
+            # The file is gone from THIS folder; a copy another source holds survives.
+            self.store.delete_items_batch(item_ids, owner_source_id=source_id)
         self.store.db.execute(
             "DELETE FROM folder_file_state WHERE source_id = ? AND file_path = ?",
             (source_id, file_path))
         self.store.db.commit()
         logger.info("Deleted file removed: %s (%d items)", file_path, len(item_ids))
 
-    async def _ingest_file(self, file_path: str, source_id: str, namespace: str, props: dict, old_item_ids: list[str]) -> list[str] | None:
-        """Ingest a single file and return list of created item IDs, or None on failure."""
+    async def _ingest_file(self, file_path: str, source_id: str, namespace: str, props: dict,
+                           old_item_ids: list[str]) -> tuple[list[str] | None, str]:
+        """Ingest one file.
+
+        Returns ``(item_ids, outcome)`` where *outcome* is ``"done"``,
+        ``"failed"`` (``item_ids`` is ``None``), or ``"deduped"`` -- the
+        pre-ingest gate refused the write because this exact content is already
+        in the Library. The caller needs the three cases distinguished because
+        they persist different ``folder_file_state`` statuses, and an empty
+        ``item_ids`` alone cannot tell "refused" from "ingested nothing".
+        """
         # Defense-in-depth: re-resolve symlinks before reading (TOCTOU protection)
         resolved = str(Path(file_path).resolve())
         if is_sensitive_path(resolved):
@@ -313,15 +463,19 @@ class FolderWatcher:
             )
             now = datetime.now().isoformat()
             self._update_state(source_id, file_path, "", 0, json.dumps(old_item_ids), now, "failed", "sensitive path blocked")
-            return None
+            return None, "failed"
         try:
             before_ids = {r["id"] for r in self.store.db.execute(
                 "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()}
 
-            await self.pipeline.ingest_file(
+            job_id = await self.pipeline.ingest_file(
                 file_path, source_id=source_id, namespace=namespace,
                 original_name=Path(file_path).name,
                 old_item_ids=old_item_ids)
+
+            if job_id and (self.pipeline.get_job_status(job_id) or {}).get(
+                    "status") == DUPLICATE_JOB_STATUS:
+                return [], "deduped"
 
             # Detect partial failure (pipeline rolls back but doesn't raise)
             row = self.store.db.execute(
@@ -329,17 +483,17 @@ class FolderWatcher:
             if row and row["sync_status"] == "error":
                 now = datetime.now().isoformat()
                 self._update_state(source_id, file_path, "", 0, json.dumps(old_item_ids), now, "failed", "partial ingestion failure")
-                return None
+                return None, "failed"
 
             after_ids = {r["id"] for r in self.store.db.execute(
                 "SELECT id FROM items WHERE source_id = ?", (source_id,)).fetchall()}
 
-            return list(after_ids - before_ids)
+            return list(after_ids - before_ids), "done"
         except Exception as e:
             logger.exception("Failed to ingest %s", file_path)
             now = datetime.now().isoformat()
             self._update_state(source_id, file_path, "", 0, json.dumps(old_item_ids), now, "failed", str(e)[:500])
-            return None
+            return None, "failed"
 
     @staticmethod
     def _hash_file(path: str) -> str | None:

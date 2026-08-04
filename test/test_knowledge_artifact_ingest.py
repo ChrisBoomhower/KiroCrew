@@ -1,6 +1,7 @@
 """Tests for artifact -> Knowledge Library auto-ingest (aggregate source model)."""
 
 import asyncio
+import hashlib
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -119,7 +120,10 @@ class TestIngestTextGroupReplace:
         await pipeline.ingest_text("body", title="A", source_id=sid, old_item_ids=[])
         pipeline._maybe_dedup.assert_not_called()
         await pipeline.ingest_text("other", title="B", source_id=sid)
-        pipeline._maybe_dedup.assert_called_once_with(sid)
+        # The just-written document's hash is passed too: a source id alone is
+        # ambiguous once one source holds several documents.
+        pipeline._maybe_dedup.assert_called_once_with(
+            sid, hashlib.sha256(b"other").hexdigest())
 
 
 class TestEnsureArtifactSource:

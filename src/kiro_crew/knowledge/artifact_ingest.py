@@ -54,7 +54,7 @@ from kiro_crew.security import (
 )
 from kiro_crew.sel import sel
 
-from .ingestion import IngestionPipeline
+from .ingestion import DUPLICATE_JOB_STATUS, IngestionPipeline
 from .store import KnowledgeStore
 
 logger = logging.getLogger(__name__)
@@ -153,17 +153,23 @@ def _set_state(
     content_hash: str,
     item_ids: list[str],
     name: str,
+    status: str = "active",
 ) -> None:
     """Record the content hash + item-id group + display name for one artifact,
     keyed by slug in the dedicated ``artifact_item_state`` table. ``name`` is the
     (redacted) artifact name, used as the per-artifact group label in the
-    Sources UI."""
+    Sources UI.
+
+    ``status`` is written explicitly on every call because the statement is an
+    ``INSERT OR REPLACE``: omitting it would reset a ``deduped`` marker back to
+    the column default, and the artifact would be re-ingested and re-collapsed on
+    every event."""
     now = datetime.now().isoformat()
     kstore.db.execute(
         "INSERT OR REPLACE INTO artifact_item_state "
-        "(source_id, slug, content_hash, item_ids, updated_at, name) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        (source_id, slug, content_hash, json.dumps(item_ids), now, name),
+        "(source_id, slug, content_hash, item_ids, updated_at, name, status) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (source_id, slug, content_hash, json.dumps(item_ids), now, name, status),
     )
     kstore.db.commit()
 
@@ -249,8 +255,11 @@ async def ingest_artifact(
 
     content_hash = hashlib.sha256(text.encode()).hexdigest()
     prev_hash, old_item_ids = _get_state(kstore, source_id, slug)
-    if prev_hash == content_hash:
-        # Unchanged since last ingest -- cheap no-op (per-slug short-circuit).
+    if prev_hash == content_hash and old_item_ids:
+        # Unchanged since last ingest AND still holding its items -- cheap no-op
+        # (per-slug short-circuit). A row with an empty group was left by a refused
+        # write, so it falls through and re-attempts rather than reporting a
+        # document the Library does not hold.
         return None
 
     ext = _KIND_EXT.get(art.kind)
@@ -301,6 +310,14 @@ async def ingest_artifact(
                 pass
 
     status = (pipeline.get_job_status(job_id) or {}).get("status") if job_id else None
+    if status == DUPLICATE_JOB_STATUS:
+        # The pre-ingest gate refused the write because this text is already in
+        # the Library under another source, and deleted this artifact's previous
+        # items on the way out. Record that: leaving the prior state would point
+        # at deleted items and make every subsequent artifact event re-attempt a
+        # write the gate will refuse again.
+        _set_state(kstore, source_id, slug, content_hash, [], title, status="deduped")
+        return job_id
     if status != "completed":
         # Partial/failed ingest: ingest_file kept the old group and rolled back
         # the new items. Leave the recorded state untouched so the next event
@@ -332,7 +349,7 @@ def remove_artifact(kstore: KnowledgeStore, source_id: str, slug: str) -> int:
     Returns the number of Knowledge items removed."""
     _prev_hash, item_ids = _get_state(kstore, source_id, slug)
     if item_ids:
-        kstore.delete_items_batch(item_ids)
+        kstore.delete_items_batch(item_ids, owner_source_id=source_id)
     _del_state(kstore, source_id, slug)
     if item_ids:
         logger.info(
